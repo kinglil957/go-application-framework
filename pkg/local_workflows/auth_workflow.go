@@ -18,7 +18,7 @@ import (
 const (
 	workflowNameAuth  = "auth"
 	headlessFlag      = "headless"
-	authTypeParameter = "auth-type"
+	AuthTypeParameter = "auth-type"
 )
 
 var authTypeDescription = fmt.Sprint("Authentication type (", auth.AUTH_TYPE_TOKEN, ", ", auth.AUTH_TYPE_OAUTH, ")")
@@ -39,7 +39,7 @@ var ConfigurationNewAuthenticationToken = "internal_new_snyk_token"
 // InitAuth initializes the auth workflow before registering it with the engine.
 func InitAuth(engine workflow.Engine) error {
 	config := pflag.NewFlagSet(workflowNameAuth, pflag.ExitOnError)
-	config.String(authTypeParameter, "", authTypeDescription)
+	config.String(AuthTypeParameter, "", authTypeDescription)
 	config.Bool(headlessFlag, false, "Enable headless OAuth authentication")
 	config.String(auth.PARAMETER_CLIENT_SECRET, "", "Client Credential Grant, client secret")
 	config.String(auth.PARAMETER_CLIENT_ID, "", "Client Credential Grant, client id")
@@ -59,6 +59,13 @@ func authEntryPoint(invocationCtx workflow.InvocationContext, _ []workflow.Data)
 	config := invocationCtx.GetConfiguration()
 	logger := invocationCtx.GetEnhancedLogger()
 	engine := invocationCtx.GetEngine()
+	globalConfig := engine.GetConfiguration()
+
+	// cache always interferes with auth
+	globalConfig.ClearCache()
+
+	// make sure the updated environment is forwarded to global config
+	defer globalConfig.ClearCache()
 
 	httpClient := invocationCtx.GetNetworkAccess().GetUnauthorizedHttpClient()
 	authenticator := auth.NewOAuth2AuthenticatorWithOpts(
@@ -69,7 +76,7 @@ func authEntryPoint(invocationCtx workflow.InvocationContext, _ []workflow.Data)
 		auth.WithLogger(logger),
 	)
 
-	err = entryPointDI(invocationCtx, logger, engine, authenticator)
+	err = AuthEntryPointDI(invocationCtx, logger, engine, authenticator)
 	return nil, err
 }
 
@@ -95,22 +102,28 @@ func autoDetectAuthType(config configuration.Configuration) string {
 	return auth.AUTH_TYPE_OAUTH
 }
 
-func entryPointDI(invocationCtx workflow.InvocationContext, logger *zerolog.Logger, engine workflow.Engine, authenticator auth.Authenticator) (err error) {
+func AuthEntryPointDI(invocationCtx workflow.InvocationContext, logger *zerolog.Logger, engine workflow.Engine, authenticator auth.Authenticator) (err error) {
 	analytics := invocationCtx.GetAnalytics()
+	globalConfig := engine.GetConfiguration()
 	config := invocationCtx.GetConfiguration()
 
-	authType := config.GetString(authTypeParameter)
+	authType := config.GetString(AuthTypeParameter)
 	if len(authType) == 0 {
 		authType = autoDetectAuthType(config)
 	}
 
 	logger.Printf("Authentication Type: %s", authType)
-	analytics.AddExtensionStringValue(authTypeParameter, authType)
+	analytics.AddExtensionStringValue(AuthTypeParameter, authType)
+
+	existingSnykToken := config.GetString(configuration.AUTHENTICATION_TOKEN)
+	// always attempt to clear existing tokens before triggering auth for current config clone and global config
+	logger.Print("Unset existing auth keys")
+	config.Unset(configuration.AUTHENTICATION_TOKEN)
+	config.Unset(auth.CONFIG_KEY_OAUTH_TOKEN)
+	globalConfig.Unset(configuration.AUTHENTICATION_TOKEN)
+	globalConfig.Unset(auth.CONFIG_KEY_OAUTH_TOKEN)
 
 	if strings.EqualFold(authType, auth.AUTH_TYPE_OAUTH) { // OAUTH flow
-		logger.Printf("Unset legacy token key %q from config", configuration.AUTHENTICATION_TOKEN)
-		config.Unset(configuration.AUTHENTICATION_TOKEN)
-
 		headless := config.GetBool(headlessFlag)
 		logger.Printf("Headless: %v", headless)
 
@@ -119,44 +132,42 @@ func entryPointDI(invocationCtx workflow.InvocationContext, logger *zerolog.Logg
 			return err
 		}
 
+		newToken := config.Get(auth.CONFIG_KEY_OAUTH_TOKEN)
+		globalConfig.Set(auth.CONFIG_KEY_OAUTH_TOKEN, newToken)
+
 		err = ui.DefaultUi().Output(auth.AUTHENTICATED_MESSAGE)
 		if err != nil {
 			logger.Debug().Err(err).Msg("Failed to output authenticated message")
 		}
 	} else if strings.EqualFold(authType, auth.AUTH_TYPE_PAT) { // PAT flow
-		engine.GetConfiguration().PersistInStorage(auth.CONFIG_KEY_TOKEN)
-
-		oldToken := config.GetString(configuration.AUTHENTICATION_TOKEN)
+		globalConfig.PersistInStorage(auth.CONFIG_KEY_TOKEN)
 		pat := config.GetString(ConfigurationNewAuthenticationToken)
-
-		logger.Print("Unset existing auth keys from config")
-		config.Unset(auth.CONFIG_KEY_OAUTH_TOKEN)
-		config.Unset(configuration.AUTHENTICATION_TOKEN)
 
 		logger.Print("Validating pat")
 		whoamiConfig := config.Clone()
+		whoamiConfig.ClearCache()
+		// we don't want to use the cache here, so this is a workaround
 		whoamiConfig.Set(configuration.FLAG_EXPERIMENTAL, true)
 		whoamiConfig.Set(configuration.AUTHENTICATION_TOKEN, pat)
 		_, whoamiErr := engine.InvokeWithConfig(workflow.NewWorkflowIdentifier("whoami"), whoamiConfig)
 		if whoamiErr != nil {
 			// reset config file
-			if len(oldToken) > 0 {
-				config.Set(auth.CONFIG_KEY_TOKEN, oldToken)
+			if len(existingSnykToken) > 0 {
+				config.Set(auth.CONFIG_KEY_TOKEN, existingSnykToken)
 			}
 			return whoamiErr
 		}
 
 		logger.Print("Validation successful; set pat credentials in config")
-		engine.GetConfiguration().Set(auth.CONFIG_KEY_TOKEN, pat)
+		// we don't want to use the cache here, so this is a workaround
+		globalConfig.ClearCache()
+		globalConfig.Set(auth.CONFIG_KEY_TOKEN, pat)
 
 		err = ui.DefaultUi().Output(auth.AUTHENTICATED_MESSAGE)
 		if err != nil {
 			logger.Debug().Err(err).Msg("Failed to output authenticated message")
 		}
 	} else { // LEGACY flow
-		logger.Printf("Unset oauth key %q from config", auth.CONFIG_KEY_OAUTH_TOKEN)
-		config.Unset(auth.CONFIG_KEY_OAUTH_TOKEN)
-
 		config.Set(configuration.RAW_CMD_ARGS, os.Args[1:])
 		config.Set(configuration.WORKFLOW_USE_STDIO, true)
 		config.Set(configuration.AUTHENTICATION_TOKEN, "") // clear token to avoid using it during authentication

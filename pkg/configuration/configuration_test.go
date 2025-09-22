@@ -230,7 +230,7 @@ func Test_ConfigurationSet_differentCases(t *testing.T) {
 		err := config.AddFlagSet(flagset)
 		assert.NoError(t, err)
 		config.AddAlternativeKeys(ORGANIZATION, []string{"snyk_cfg_org"})
-		config.AddDefaultValue(ORGANIZATION, func(existingValue interface{}) (interface{}, error) {
+		config.AddDefaultValue(ORGANIZATION, func(_ Configuration, existingValue interface{}) (interface{}, error) {
 			if existingValue != nil {
 				return existingValue, nil
 			}
@@ -291,7 +291,7 @@ func Test_ConfigurationClone(t *testing.T) {
 	flagset.Bool("debug", true, "debugging")
 	flagset.Float64("size", 10, "size")
 
-	config := NewFromFiles(TEST_FILENAME)
+	config := NewWithOpts(WithFiles(TEST_FILENAME))
 	err := config.AddFlagSet(flagset)
 	assert.NoError(t, err)
 
@@ -351,7 +351,8 @@ func Test_ConfigurationClone(t *testing.T) {
 	assert.Equal(t, expectedAlternateValue, actualAlternateValue)
 
 	// we assume that a cloned configuration uses the same storage object. Just the pointer is cloned.
-	assert.Equal(t, config.(*extendedViper).storage, clonedConfig.(*extendedViper).storage)
+	assert.Equal(t, config.(*extendedViper).storage, clonedConfig.(*extendedViper).storage)                         //nolint:errcheck //in this test, the type is clear
+	assert.Equal(t, config.(*extendedViper).automaticEnvEnabled, clonedConfig.(*extendedViper).automaticEnvEnabled) //nolint:errcheck //in this test, the type is clear
 
 	cleanupConfigstore(t)
 }
@@ -376,7 +377,7 @@ func TestNewFromFiles(t *testing.T) {
 func TestNewInMemory_shouldNotBreakWhenTryingToPersist(t *testing.T) {
 	config := NewInMemory()
 
-	assert.Nil(t, config.(*extendedViper).storage)
+	assert.Nil(t, config.(*extendedViper).storage) //nolint:errcheck //in this test, the type is clear
 	assert.NotNil(t, config)
 
 	const key = "test"
@@ -395,7 +396,7 @@ func Test_DefaultValuehandling(t *testing.T) {
 		valueExplicitlySet := "explicitly set value"
 
 		config := NewInMemory()
-		config.AddDefaultValue(keyWithDefault, func(existingValue interface{}) (interface{}, error) {
+		config.AddDefaultValue(keyWithDefault, func(_ Configuration, existingValue interface{}) (interface{}, error) {
 			if existingValue != nil {
 				return existingValue, nil
 			}
@@ -433,7 +434,7 @@ func Test_DefaultValuehandling(t *testing.T) {
 		err := config.AddFlagSet(flagset)
 		assert.NoError(t, err)
 		config.AddAlternativeKeys(ORGANIZATION, []string{"snyk_cfg_org"})
-		config.AddDefaultValue(ORGANIZATION, func(existingValue interface{}) (interface{}, error) {
+		config.AddDefaultValue(ORGANIZATION, func(_ Configuration, existingValue interface{}) (interface{}, error) {
 			if existingValue != nil {
 				return existingValue, nil
 			}
@@ -560,6 +561,51 @@ func Test_Configuration_Locking(t *testing.T) {
 		}
 
 		wg.Wait()
+	})
+}
+
+func Test_ImmutableDefaultValueFunction(t *testing.T) {
+	t.Run("direct function behavior", func(t *testing.T) {
+		defaultValue := "immutable-default"
+		fn := ImmutableDefaultValueFunction(defaultValue)
+
+		result, err := fn(nil, nil)
+		assert.NoError(t, err)
+		assert.Equal(t, defaultValue, result)
+
+		result, err = fn(nil, "some-existing-value")
+		assert.NoError(t, err)
+		assert.Equal(t, defaultValue, result)
+
+		result, err = fn(nil, 123)
+		assert.NoError(t, err)
+		assert.Equal(t, defaultValue, result)
+
+		result, err = fn(nil, true)
+		assert.NoError(t, err)
+		assert.Equal(t, defaultValue, result)
+	})
+
+	t.Run("comparison with StandardDefaultValueFunction", func(t *testing.T) {
+		standardKey := "standard-key"
+		immutableKey := "immutable-key"
+		defaultValue := "default"
+		explicitValue := "explicit"
+
+		config := NewInMemory()
+		config.AddDefaultValue(standardKey, StandardDefaultValueFunction(defaultValue))
+		config.AddDefaultValue(immutableKey, ImmutableDefaultValueFunction(defaultValue))
+
+		assert.Equal(t, defaultValue, config.GetString(standardKey))
+		assert.Equal(t, defaultValue, config.GetString(immutableKey))
+
+		config.Set(standardKey, explicitValue)
+		config.Set(immutableKey, explicitValue)
+
+		// StandardDefaultValueFunction should return the explicit value
+		assert.Equal(t, explicitValue, config.GetString(standardKey))
+		// ImmutableDefaultValueFunction should still return the default value
+		assert.Equal(t, defaultValue, config.GetString(immutableKey))
 	})
 }
 
@@ -799,7 +845,7 @@ func Test_Configuration_caching_enabled(t *testing.T) {
 	cacheDuration := 10 * time.Minute
 
 	config := NewWithOpts(WithCachingEnabled(cacheDuration))
-	config.AddDefaultValue(myKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(myKey, func(_ Configuration, existingValue interface{}) (interface{}, error) {
 		defaultFuncCalled++
 
 		if existingValue != nil {
@@ -895,4 +941,122 @@ func Test_toDuration(t *testing.T) {
 			assert.Equal(t, actual, tcase.expected)
 		})
 	}
+}
+
+func Test_Configuration_GetStringSliceString(t *testing.T) {
+	key := "key1"
+	expected := []string{"value1", "value2"}
+	config := NewWithOpts()
+	config.Set(key, expected)
+
+	// access slice as slice
+	actual := config.GetStringSlice(key)
+	assert.Equal(t, expected, actual)
+
+	// access slice as string
+	actualString := config.GetString(key)
+	assert.Equal(t, expected[0], actualString)
+}
+
+func Test_Configuration_AddKeyDependency_happy(t *testing.T) {
+	key1 := "key1"
+	key2 := "key2"
+	key3 := "key3"
+	key1Count := 0
+	key2Count := 0
+	key3Count := 0
+
+	config := NewWithOpts(WithCachingEnabled(10 * time.Minute))
+
+	// define dependency
+	var err error
+	err = config.AddKeyDependency(key1, key2)
+	assert.NoError(t, err)
+	err = config.AddKeyDependency(key2, key3)
+	assert.NoError(t, err)
+
+	config.AddDefaultValue(key1, func(config Configuration, existingValue interface{}) (interface{}, error) {
+		key1Count++
+		return key1Count, nil
+	})
+
+	config.AddDefaultValue(key2, func(config Configuration, existingValue interface{}) (interface{}, error) {
+		key2Count++
+		return key2Count, nil
+	})
+
+	config.AddDefaultValue(key3, func(config Configuration, existingValue interface{}) (interface{}, error) {
+		key3Count++
+		return key3Count, nil
+	})
+
+	var actual1, actual2, actual3 int
+
+	// actual 1 and 2 should always be the same
+	actual1 = config.GetInt(key1)
+	actual2 = config.GetInt(key2)
+	actual3 = config.GetInt(key3)
+	assert.Equal(t, actual2, actual1)
+	assert.Equal(t, actual2, actual3)
+	assert.Equal(t, key1Count, actual1)
+
+	// unset dependency key3 and expect key1, key2 to be updated
+	config.Unset(key3)
+
+	actual1 = config.GetInt(key1)
+	actual2 = config.GetInt(key2)
+	actual3 = config.GetInt(key3)
+	assert.Equal(t, actual2, actual1)
+	assert.Equal(t, actual2, actual3)
+	assert.Equal(t, key1Count, actual1)
+
+	// unset dependency key2 and expect key1 to be updated but not key3
+	config.Unset(key2)
+
+	actual1 = config.GetInt(key1)
+	actual2 = config.GetInt(key2)
+	actual3 = config.GetInt(key3)
+	assert.Equal(t, actual2, actual1)
+	assert.NotEqual(t, actual2, actual3)
+	assert.Equal(t, key1Count, actual1)
+}
+
+func Test_Configuration_AddKeyDependency_CircularDependency(t *testing.T) {
+	config := NewWithOpts(WithCachingEnabled(10 * time.Minute))
+
+	// key1 -> key1.1 -> key1.1.1 -> key1.1.1.1
+	//                -> key1.1.2
+	// key1 -> key1.2 -> key1.2.1 -> key1.2.1.1 -> key1.2.1.1.1
+
+	var err error
+
+	err = config.AddKeyDependency("key1.1", "key1.1.1")
+	assert.NoError(t, err)
+
+	err = config.AddKeyDependency("key1.1.1", "key1.1.1.1")
+	assert.NoError(t, err)
+
+	err = config.AddKeyDependency("key1.1.2", "key1.1.2.1")
+	assert.NoError(t, err)
+
+	err = config.AddKeyDependency("key1.2", "key1.2.1")
+	assert.NoError(t, err)
+
+	err = config.AddKeyDependency("key1.2.1", "key1.2.1.1")
+	assert.NoError(t, err)
+
+	err = config.AddKeyDependency("key1.2.1.1", "key1.2.1.1.1")
+	assert.NoError(t, err)
+
+	// detect direct circular dependency
+	err = config.AddKeyDependency("key1.2.1.1.1", "key1.2.1.1")
+	assert.Error(t, err)
+
+	// detect indirect circular dependency
+	err = config.AddKeyDependency("key1.1.1.1", "key1.1")
+	assert.Error(t, err)
+
+	// detect indirect circular dependency
+	err = config.AddKeyDependency("key1", "key1")
+	assert.Error(t, err)
 }

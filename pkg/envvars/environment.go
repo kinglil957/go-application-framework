@@ -10,24 +10,40 @@ import (
 	"time"
 
 	"github.com/subosito/gotenv"
+
+	"github.com/snyk/go-application-framework/pkg/utils"
 )
 
-// LoadConfiguredEnvironment updates the environment with local configuration. Precedence as follows:
-//  1. std folder-based config files
-//  2. given command-line parameter config file
-//  3. std config file in home directory
-//  4. global shell configuration
+// Environment variable names
+const (
+	PathEnvVarName  = "PATH"
+	ShellEnvVarName = "SHELL"
+)
+
+// LoadConfiguredEnvironment updates the environment with user and local configuration.
+// First Bash's env is read (as a fallback), then the user's preferred SHELL's env is read, then the configuration files.
+// The Bash env PATH is appended to the existing PATH (as a fallback), any other new PATH read is prepended (preferential).
 func LoadConfiguredEnvironment(customConfigFiles []string, workingDirectory string) {
 	bashOutput := getEnvFromShell("bash")
 
 	// this is applied at the end always, as it does not overwrite existing variables
 	defer func() { _ = gotenv.Apply(strings.NewReader(bashOutput)) }() //nolint:errcheck // we can't do anything with the error
 
-	env := gotenv.Parse(strings.NewReader(bashOutput))
-	specificShell, ok := env["SHELL"]
+	bashEnv := gotenv.Parse(strings.NewReader(bashOutput))
+
+	if bashPATH, ok := bashEnv[PathEnvVarName]; ok {
+		UpdatePath(bashPATH, false)
+	}
+
+	specificShell, ok := bashEnv[ShellEnvVarName]
 	if ok {
 		fromSpecificShell := getEnvFromShell(specificShell)
 		_ = gotenv.Apply(strings.NewReader(fromSpecificShell)) //nolint:errcheck // we can't do anything with the error
+
+		specificShellEnv := gotenv.Parse(strings.NewReader(fromSpecificShell))
+		if specificShellPATH, ok := specificShellEnv[PathEnvVarName]; ok {
+			UpdatePath(specificShellPATH, true)
+		}
 	}
 
 	// process config files
@@ -41,7 +57,7 @@ func LoadConfiguredEnvironment(customConfigFiles []string, workingDirectory stri
 
 func loadFile(fileName string) {
 	// preserve path
-	path := os.Getenv("PATH")
+	previousPath := os.Getenv(PathEnvVarName)
 
 	// overwrite existing variables with file config
 	err := gotenv.OverLoad(fileName)
@@ -50,7 +66,7 @@ func loadFile(fileName string) {
 	}
 
 	// add previous path to the end of the new
-	UpdatePath(path, false)
+	UpdatePath(previousPath, false)
 }
 
 // guard against command injection
@@ -92,39 +108,38 @@ func getEnvFromShell(shell string) string {
 	return string(env)
 }
 
-// UpdatePath prepends or appends the extension to the current path. If the entry is already there, it skips it. The
-// result is set into the process environment with os.Setenv.
+// UpdatePath prepends or appends the extension to the current path.
+// For append, if the entry is already there, it will not be re-added / moved.
+// For prepend, if the entry is already there, it will be correctly re-prioritized to the front.
+// The result is set into the process environment with os.Setenv.
 //
 //	pathExtension string the path component to be added.
 //	prepend bool whether to pre- or append
 func UpdatePath(pathExtension string, prepend bool) string {
-	pathVarName := "PATH"
+	currentPath := os.Getenv(PathEnvVarName)
 
 	if pathExtension == "" {
-		return os.Getenv(pathVarName)
+		return currentPath
 	}
 
-	currentPath := os.Getenv(pathVarName)
+	if currentPath == "" {
+		_ = os.Setenv(PathEnvVarName, pathExtension)
+		return pathExtension
+	}
+
 	currentPathEntries := strings.Split(currentPath, string(os.PathListSeparator))
-
-	pathEntries := map[string]bool{}
-	for _, entry := range currentPathEntries {
-		pathEntries[entry] = true
-	}
-
 	addPathEntries := strings.Split(pathExtension, string(os.PathListSeparator))
-	var newPathSlice []string
-	for _, entry := range addPathEntries {
-		if !pathEntries[entry] {
-			newPathSlice = append(newPathSlice, entry)
-		}
+
+	var combinedSliceWithDuplicates []string
+	if prepend {
+		combinedSliceWithDuplicates = append(addPathEntries, currentPathEntries...)
+	} else {
+		combinedSliceWithDuplicates = append(currentPathEntries, addPathEntries...)
 	}
 
-	resultSlice := append(newPathSlice, currentPathEntries...)
-	if !prepend {
-		resultSlice = append(currentPathEntries, newPathSlice...)
-	}
-	newPath := strings.Join(resultSlice, string(os.PathListSeparator))
-	_ = os.Setenv(pathVarName, newPath)
+	newPathSlice := utils.Dedupe(combinedSliceWithDuplicates)
+
+	newPath := strings.Join(newPathSlice, string(os.PathListSeparator))
+	_ = os.Setenv(PathEnvVarName, newPath)
 	return newPath
 }

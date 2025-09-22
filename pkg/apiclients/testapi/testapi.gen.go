@@ -161,6 +161,11 @@ const (
 	SbomReachability SbomReachabilitySubjectType = "sbom_reachability"
 )
 
+// Defines values for SbomSubjectType.
+const (
+	Sbom SbomSubjectType = "sbom"
+)
+
 // Defines values for ScmRepoLocatorType.
 const (
 	ScmRepo ScmRepoLocatorType = "scm_repo"
@@ -661,6 +666,10 @@ type LocalPathLocatorType string
 
 // LocalPolicy Locally configured policy options for determining outcome of this specific test.
 type LocalPolicy struct {
+	// FailOnUpgradable Use to fail a test when there is at least one vulnerable finding that can be fixed by upgrading the version of the related
+	//    dependency. E.g. bumping lodash from 1.1.1 to 1.1.2.
+	FailOnUpgradable *bool `json:"fail_on_upgradable,omitempty"`
+
 	// RiskScoreThreshold Findings of equal or greater risk score will fail the test.
 	RiskScoreThreshold *uint16 `json:"risk_score_threshold,omitempty"`
 
@@ -841,7 +850,7 @@ type ReachabilityEvidence struct {
 	//
 	// For example, a sequence of locations connecting the "source" location
 	// where input data is obtained, to a "sink" location where it is used.
-	Paths []ReachablePath `json:"paths"`
+	Paths *[]ReachablePath `json:"paths,omitempty"`
 
 	// Reachability Reachability enum for reachability signal.
 	Reachability ReachabilityType           `json:"reachability"`
@@ -893,6 +902,19 @@ type SbomReachabilitySubject struct {
 
 // SbomReachabilitySubjectType defines model for SbomReachabilitySubject.Type.
 type SbomReachabilitySubjectType string
+
+// SbomSubject Test subject for SBOM test with reachability analysis.
+type SbomSubject struct {
+	// Locator Locate the local paths from which the SBOM and source code were derived.
+	Locator LocalPathLocator `json:"locator"`
+
+	// SbomBundleId The SBOM to test for vulnerable dependencies.
+	SbomBundleId string          `json:"sbom_bundle_id"`
+	Type         SbomSubjectType `json:"type"`
+}
+
+// SbomSubjectType defines model for SbomSubject.Type.
+type SbomSubjectType string
 
 // ScmRepoLocator ScmRepoLocator locates a test subject by SCM repository coordinates.
 type ScmRepoLocator struct {
@@ -1049,6 +1071,9 @@ type SnykVulnProblem struct {
 	// as those publicly distributed.
 	Ecosystem SnykvulndbPackageEcosystem `json:"ecosystem"`
 
+	// EpssDetails EPSS details - see note on model definition.
+	EpssDetails *SnykvulndbEpssDetails `json:"epss_details,omitempty"`
+
 	// ExploitDetails Details about the maturity of exploits for this vulnerability.
 	ExploitDetails SnykvulndbExploitDetails `json:"exploit_details"`
 	Id             string                   `json:"id"`
@@ -1079,6 +1104,10 @@ type SnykVulnProblem struct {
 
 	// PackageName Package name.
 	PackageName string `json:"package_name"`
+
+	// PackagePopularityRank Percentile rank indicating the package's prevalence across Snyk-monitored projects.
+	// A higher rank signifies the package is used in a larger percentage of projects.
+	PackagePopularityRank *float32 `json:"package_popularity_rank,omitempty"`
 
 	// PackageRepositoryUrl Link to the package repository containing the vulnerable package.
 	PackageRepositoryUrl *string `json:"package_repository_url,omitempty"`
@@ -1560,6 +1589,23 @@ type SnykvulndbCvssSource struct {
 // SnykvulndbCvssSourceType Indicate whether the CVSS source is primary (recommended) or secondary
 // (provided as supplemental information).
 type SnykvulndbCvssSourceType string
+
+// SnykvulndbEpssDetails Exploit Prediction Scoring System (EPSS), which predicts the likelihood (probability) of the vulnerability to be
+// exploited, and the percentile of the EPSS of a vulnerability relative to all other vulnerabilities.
+// We are using the latest model.
+// https://www.first.org/epss/model
+type SnykvulndbEpssDetails struct {
+	// ModelVersion The version of the EPSS model we use.
+	ModelVersion string `json:"model_version"`
+
+	// Percentile The percentile of the EPSS of a vulnerability relative to all other vulnerabilities.
+	// In value range 0 - 1 with 5 fixed digits.
+	Percentile string `json:"percentile"`
+
+	// Probability The probability of the vulnerability to be exploited.
+	// In value range 0 - 1 with 5 fixed digits.
+	Probability string `json:"probability"`
+}
 
 // SnykvulndbExploitDetails Details about the exploitability of a vulnerability.
 type SnykvulndbExploitDetails struct {
@@ -3207,6 +3253,34 @@ func (t *TestSubject) MergeOtherSubject(v OtherSubject) error {
 	return err
 }
 
+// AsSbomSubject returns the union data inside the TestSubject as a SbomSubject
+func (t TestSubject) AsSbomSubject() (SbomSubject, error) {
+	var body SbomSubject
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSbomSubject overwrites any union data inside the TestSubject as the provided SbomSubject
+func (t *TestSubject) FromSbomSubject(v SbomSubject) error {
+	v.Type = "sbom"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSbomSubject performs a merge with any union data inside the TestSubject, using the provided SbomSubject
+func (t *TestSubject) MergeSbomSubject(v SbomSubject) error {
+	v.Type = "sbom"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t TestSubject) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"type"`
@@ -3229,6 +3303,8 @@ func (t TestSubject) ValueByDiscriminator() (interface{}, error) {
 		return t.AsGitUrlCoordinatesSubject()
 	case "other":
 		return t.AsOtherSubject()
+	case "sbom":
+		return t.AsSbomSubject()
 	case "sbom_reachability":
 		return t.AsSbomReachabilitySubject()
 	default:
@@ -3386,6 +3462,34 @@ func (t *TestSubjectCreate) MergeOtherSubject(v OtherSubject) error {
 	return err
 }
 
+// AsSbomSubject returns the union data inside the TestSubjectCreate as a SbomSubject
+func (t TestSubjectCreate) AsSbomSubject() (SbomSubject, error) {
+	var body SbomSubject
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSbomSubject overwrites any union data inside the TestSubjectCreate as the provided SbomSubject
+func (t *TestSubjectCreate) FromSbomSubject(v SbomSubject) error {
+	v.Type = "sbom"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSbomSubject performs a merge with any union data inside the TestSubjectCreate, using the provided SbomSubject
+func (t *TestSubjectCreate) MergeSbomSubject(v SbomSubject) error {
+	v.Type = "sbom"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t TestSubjectCreate) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"type"`
@@ -3408,6 +3512,8 @@ func (t TestSubjectCreate) ValueByDiscriminator() (interface{}, error) {
 		return t.AsGitUrlCoordinatesSubject()
 	case "other":
 		return t.AsOtherSubject()
+	case "sbom":
+		return t.AsSbomSubject()
 	case "sbom_reachability":
 		return t.AsSbomReachabilitySubject()
 	default:

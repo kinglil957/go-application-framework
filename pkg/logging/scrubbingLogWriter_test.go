@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os/user"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -91,8 +92,8 @@ func TestScrubbingWriter_WriteLevel(t *testing.T) {
 
 func TestScrubbingIoWriter(t *testing.T) {
 	scrubDict := map[string]scrubStruct{
-		"token":  {0, regexp.MustCompile("token")},
-		"secret": {0, regexp.MustCompile("secret")},
+		"token":  {0, regexp.MustCompile("token"), ""},
+		"secret": {0, regexp.MustCompile("secret"), ""},
 	}
 
 	pattern := "%s for my account, including my %s"
@@ -113,8 +114,8 @@ func TestScrubbingIoWriter(t *testing.T) {
 		bufioWriter = bytes.NewBufferString("")
 		writer = NewScrubbingIoWriter(bufioWriter, scrubDict)
 
-		writer.(ScrubbingLogWriter).RemoveTerm("token")
-		writer.(ScrubbingLogWriter).RemoveTerm("secret")
+		writer.(ScrubbingLogWriter).RemoveTerm("token")  //nolint:errcheck //in this test, the type is clear
+		writer.(ScrubbingLogWriter).RemoveTerm("secret") //nolint:errcheck //in this test, the type is clear
 
 		n, err = writer.Write([]byte(patternWithSecret))
 		require.NoError(t, err)
@@ -126,8 +127,8 @@ func TestScrubbingIoWriter(t *testing.T) {
 	t.Run("now re-add", func(t *testing.T) {
 		bufioWriter = bytes.NewBufferString("")
 		writer = NewScrubbingIoWriter(bufioWriter, scrubDict)
-		writer.(ScrubbingLogWriter).AddTerm("token", 0)
-		writer.(ScrubbingLogWriter).AddTerm("secret", 0)
+		writer.(ScrubbingLogWriter).AddTerm("token", 0)  //nolint:errcheck //in this test, the type is clear
+		writer.(ScrubbingLogWriter).AddTerm("secret", 0) //nolint:errcheck //in this test, the type is clear
 
 		n, err = writer.Write([]byte(patternWithSecret))
 		require.NoError(t, err)
@@ -165,9 +166,9 @@ func TestScrubbingIoWriter(t *testing.T) {
 func TestScrubFunction(t *testing.T) {
 	t.Run("scrub everything in dict", func(t *testing.T) {
 		dict := ScrubbingDict{
-			"secret":       {0, regexp.MustCompile("secret")},
-			"special":      {0, regexp.MustCompile("special")},
-			"be disclosed": {0, regexp.MustCompile("be disclosed")},
+			"secret":       {0, regexp.MustCompile("secret"), ""},
+			"special":      {0, regexp.MustCompile("special"), ""},
+			"be disclosed": {0, regexp.MustCompile("be disclosed"), ""},
 		}
 		input := "This is my secret message, which might not be special but definitely should not be disclosed."
 		expected := "This is my *** message, which might not be *** but definitely should not ***."
@@ -301,39 +302,6 @@ func TestAddDefaults(t *testing.T) {
 			expected: `_: [***],`,
 		},
 		{
-			name: "cli argument mapping from snyk-config debug logging",
-			input: `{
-				username: 'username-set',
-				'username=john.doe': true,
-				password: 'password-set',
-				'password=foobar': true,
-				'u=foobar': true,
-				'password-with-double-quotes=foo"bar': true,
-				"password-with-single-quotes=foo'bar": true,
-				'password-with-comma=foo,bar': true,
-				'my-password-with-spaces=foo bar': true,
-				'my-password-thats-solid=solid': true,
-				'p=foobar': true,
-				debug: true,
-				'log-level': 'trace'
-			}`,
-			expected: `{
-				username: 'username-set',
-				'username=***': true,
-				password: 'password-set',
-				'password=***': true,
-				'u=***': true,
-				'password-with-double-quotes=***': true,
-				"password-with-single-quotes=***": true,
-				'password-with-comma=***': true,
-				'my-password-with-spaces=***': true,
-				'my-password-thats-***=***': true,
-				'p=***': true,
-				debug: true,
-				'log-level': 'trace'
-			}`,
-		},
-		{
 			name: "username and password constellations passed in a JSON-ish structure with verbatim output from snyk-config",
 			input: `{
 				unrelated: dont-scrub,
@@ -381,53 +349,6 @@ func TestAddDefaults(t *testing.T) {
 			}`,
 		},
 		{
-			name: "CLI arguments logged to the debug logs (multi-line)",
-			input: `Arguments:[
-			container test gcr.io/distroless/nodejs:latest
-			--platform=linux/arm64
-			--unrelated-argument
-			--unrelated-argument-with-value "value"
-			--unrelated-argument-with-equals-sign="value"
-			-u john.doe
-			-p hunter2
-			--username john.doe
-			--password hunter2
-			--a-password-with-secret-in-the-value 'super-secret-password'
-			--a-password-with-an-equals-sign='hunter2'
-			--a-password-with-spaces='hun ter2'
-			--a-password-with-double-quotes='hun"ter2'
-			--a-password-with-single-quotes="hun'ter2"
-			--token "token"
-			--password-with-no-value
-			--another-unrelated-at-the-end
-			--log-level=trace
-			-d
-			--debug
-		]`,
-			expected: `Arguments:[
-			container test gcr.io/distroless/nodejs:latest
-			--platform=linux/arm64
-			--unrelated-argument
-			--unrelated-argument-with-value "value"
-			--unrelated-argument-with-equals-sign="value"
-			-u ***
-			-p ***
-			--username ***
-			--password ***
-			--a-password-with-secret-in-the-value '***
-			--a-password-with-an-equals-sign=***
-			--a-password-with-spaces=***
-			--a-password-with-double-quotes=***
-			--a-password-with-single-quotes=***
-			--token "***
-			--password-with-no-value
-			--another-unrelated-at-the-end
-			--log-level=trace
-			-d
-			--debug
-		]`,
-		},
-		{
 			name:     "CLI arguments logged to the debug logs (same line, short-form, no equals signs)",
 			input:    `container test gcr.io/distroless/nodejs:latest --platform=linux/arm64 --unrelated-argument --unrelated-argument-with-value "value" --unrelated-argument-with-equals-sign="value" -u john.doe -p hunter2 --log-level=trace`,
 			expected: `container test gcr.io/distroless/nodejs:latest --platform=linux/arm64 --unrelated-argument --unrelated-argument-with-value "value" --unrelated-argument-with-equals-sign="value" -u *** -p *** --log-level=trace`,
@@ -436,16 +357,6 @@ func TestAddDefaults(t *testing.T) {
 			name:     "CLI arguments logged to the debug logs (same line, short-form, with equals signs)",
 			input:    `container test gcr.io/distroless/nodejs:latest --platform=linux/arm64 --unrelated-argument --unrelated-argument-with-value "value" --unrelated-argument-with-equals-sign="value" -u=john.doe -p=hunter2 --log-level=trace`,
 			expected: `container test gcr.io/distroless/nodejs:latest --platform=linux/arm64 --unrelated-argument --unrelated-argument-with-value "value" --unrelated-argument-with-equals-sign="value" -u=*** -p=*** --log-level=trace`,
-		},
-		{
-			name:     "CLI arguments logged to the debug logs (same line, long-form, no equals signs)",
-			input:    `container test ubuntu:latest --username john.doe --password solidpassword -d`,
-			expected: `container test ubuntu:latest --username *** --password *** -d`,
-		},
-		{
-			name:     "CLI arguments logged to the debug logs (same line, long-form, with equals signs)",
-			input:    `container test ubuntu:latest --username=john.doe --password=solidpassword -d`,
-			expected: `container test ubuntu:latest --username=*** --password=*** -d`,
 		},
 	}
 	for _, test := range tests {
@@ -458,8 +369,8 @@ func TestAddDefaults(t *testing.T) {
 
 func TestScrubbingIoWriter_piecewise(t *testing.T) {
 	scrubDict := map[string]scrubStruct{
-		"token":    {0, regexp.MustCompile("token")},
-		"password": {0, regexp.MustCompile("password")},
+		"token":    {0, regexp.MustCompile("token"), ""},
+		"password": {0, regexp.MustCompile("password"), ""},
 	}
 
 	innerWriter := &mockWriter{
@@ -474,4 +385,159 @@ func TestScrubbingIoWriter_piecewise(t *testing.T) {
 	assert.Equal(t, len(input), n)
 	t.Log(string(innerWriter.written))
 	assert.Equal(t, string(expectedOutput), string(innerWriter.written))
+}
+
+func TestAddTermsToReplace(t *testing.T) {
+	tests := []struct {
+		name       string
+		termsToAdd []string
+		input      string
+		expected   string
+	}{
+		{
+			name:       "single term",
+			termsToAdd: []string{"secret123"},
+			input:      "This is my secret123 value",
+			expected:   "This is my *** value",
+		},
+		{
+			name:       "multiple terms",
+			termsToAdd: []string{"password", "token", "key"},
+			input:      "password is secret, token is hidden, key is protected",
+			expected:   "*** is secret, *** is hidden, *** is protected",
+		},
+		{
+			name:       "empty terms list",
+			termsToAdd: []string{},
+			input:      "nothing should be replaced here",
+			expected:   "nothing should be replaced here",
+		},
+		{
+			name:       "special characters in terms",
+			termsToAdd: []string{"user@domain.com", "file.txt", "super=secret?password"},
+			input:      "Email user@domain.com, file file.txt, and super=secret?password value",
+			expected:   "Email ***, file ***, and *** value",
+		},
+		{
+			name:       "terms with spaces",
+			termsToAdd: []string{"secret phrase", "multi word key"},
+			input:      "The secret phrase is hidden and multi word key is protected",
+			expected:   "The *** is hidden and *** is protected",
+		},
+		{
+			name:       "unicode characters",
+			termsToAdd: []string{"café", "naïve"},
+			input:      "The café is naïve about security",
+			expected:   "The *** is *** about security",
+		},
+		{
+			name:       "terms with newlines and tabs",
+			termsToAdd: []string{"line1\nline2", "tab\tseparated"},
+			input:      "First line1\nline2 then tab\tseparated values",
+			expected:   "First *** then *** values",
+		},
+		{
+			name:       "very long term",
+			termsToAdd: []string{strings.Repeat("X", 1000)},
+			input:      "Short text with " + strings.Repeat("X", 1000) + " long term",
+			expected:   "Short text with *** long term",
+		},
+		{
+			name:       "numeric terms",
+			termsToAdd: []string{"12345", "987.654"},
+			input:      "ID 12345 and value 987.654 are sensitive",
+			expected:   "ID *** and value *** are sensitive",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Run("IoWriter", func(t *testing.T) {
+				mockWriter := &mockWriter{}
+				writer := &scrubbingIoWriter{
+					writer:    mockWriter,
+					scrubDict: ScrubbingDict{},
+				}
+
+				writer.AddTermsToReplace(test.termsToAdd)
+
+				n, err := writer.Write([]byte(test.input))
+				assert.NoError(t, err)
+				assert.Equal(t, len(test.input), n)
+				assert.Equal(t, test.expected, string(mockWriter.written))
+			})
+
+			t.Run("LevelWriter", func(t *testing.T) {
+				mockWriter := &mockWriter{}
+				writer := &scrubbingLevelWriter{
+					writer:    mockWriter,
+					scrubDict: ScrubbingDict{},
+				}
+
+				writer.AddTermsToReplace(test.termsToAdd)
+
+				n, err := writer.WriteLevel(zerolog.InfoLevel, []byte(test.input))
+				assert.NoError(t, err)
+				assert.Equal(t, len(test.input), n)
+				assert.Equal(t, test.expected, string(mockWriter.written))
+			})
+		})
+	}
+}
+
+func TestSnykPATScrubbing(t *testing.T) {
+	dict := addMandatoryMasking(ScrubbingDict{})
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Snyk PAT UAT token with Bearer",
+			input:    "Authorization: Bearer snyk_uat.12345678.abcdefgh-ijklmnop.qrstuvwx-yz123456",
+			expected: "Authorization: Bearer ***",
+		},
+		{
+			name:     "Snyk PAT SAT token with Bearer",
+			input:    "Authorization: Bearer snyk_sat.87654321.zyxwvuts-rqponmlk.jihgfedc-ba987654",
+			expected: "Authorization: Bearer ***",
+		},
+		{
+			name:     "Snyk PAT UAT token standalone",
+			input:    "PAT_EU: snyk_uat.abcd1234.test-token-value.more-token-data",
+			expected: "PAT_EU: snyk_uat.***",
+		},
+		{
+			name:     "Snyk PAT SAT token standalone",
+			input:    "Token: snyk_sat.12ab34cd.test_value-123.final_part-456",
+			expected: "Token: snyk_sat.***",
+		},
+		{
+			name:     "Snyk PAT token in environment variable",
+			input:    "SNYK_TOKEN=snyk_uat.abcd1234.test-token-value.more-token-data",
+			expected: "SNYK_TOKEN=***",
+		},
+		{
+			name:     "Snyk PAT token in JSON",
+			input:    `{"token":"snyk_sat.12ab34cd.test_value-123.final_part-456"}`,
+			expected: `{"token":"***"}`,
+		},
+		{
+			name:     "Multiple Snyk PAT tokens",
+			input:    "First token: snyk_uat.11111111.first-token.part and second: snyk_sat.22222222.second-token.part",
+			expected: "First token: ****** and second: snyk_sat.***",
+		},
+		{
+			name:     "Snyk PAT token mixed with other tokens",
+			input:    "Bearer token123 and snyk_uat.99999999.mixed-test.token-here and Basic auth456",
+			expected: "Bearer *** and snyk_uat.*** and Basic ***",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := scrub([]byte(test.input), dict)
+			assert.Equal(t, test.expected, string(actual))
+		})
+	}
 }

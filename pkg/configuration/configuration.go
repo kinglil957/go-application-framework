@@ -18,9 +18,9 @@ import (
 	"github.com/spf13/viper"
 )
 
-//go:generate $GOPATH/bin/mockgen -source=configuration.go -destination ../mocks/configuration.go -package mocks -self_package github.com/snyk/go-application-framework/pkg/configuration/
+//go:generate go tool github.com/golang/mock/mockgen -source=configuration.go -destination ../mocks/configuration.go -package mocks -self_package github.com/snyk/go-application-framework/pkg/configuration/
 
-type DefaultValueFunction func(existingValue interface{}) (interface{}, error)
+type DefaultValueFunction func(config Configuration, existingValue interface{}) (interface{}, error)
 
 type configType string
 type KeyType int
@@ -61,6 +61,10 @@ type Configuration interface {
 	GetAlternativeKeys(key string) []string
 	GetAllKeysThatContainValues(key string) []string
 	GetKeyType(key string) KeyType
+
+	// AddKeyDependency can be used to describe that a certain key and its values actually depend on another value, this can then be used to clear the cache of a key when a depending key changes.
+	// In words: key depends on dependencyKey.
+	AddKeyDependency(key string, dependencyKey string) error
 
 	// PersistInStorage ensures that when Set is called with the given key, it will be persisted in the config file.
 	PersistInStorage(key string)
@@ -103,16 +107,25 @@ type extendedViper struct {
 
 	// supportedEnvVars store the env vars that should be supported REGARDLESS of its prefix. e.g. NODE_EXTRA_CA_CERTS
 	supportedEnvVars []string
+
+	interkeyDependencies map[string][]string
 }
 
 // StandardDefaultValueFunction is a default value function that returns the default value if the existing value is nil.
 func StandardDefaultValueFunction(defaultValue interface{}) DefaultValueFunction {
-	return func(existingValue interface{}) (interface{}, error) {
+	return func(_ Configuration, existingValue interface{}) (interface{}, error) {
 		if existingValue != nil {
 			return existingValue, nil
 		} else {
 			return defaultValue, nil
 		}
+	}
+}
+
+// ImmutableDefaultValueFunction returns a default value function that always returns the same value.
+func ImmutableDefaultValueFunction(defaultValue interface{}) DefaultValueFunction {
+	return func(_ Configuration, _ interface{}) (interface{}, error) {
+		return defaultValue, nil
 	}
 }
 
@@ -231,10 +244,11 @@ func NewInMemory() Configuration {
 func createViperDefaultConfig(opts ...Opts) *extendedViper {
 	// prepare environment variables
 	config := &extendedViper{
-		viper:           viper.New(),
-		alternativeKeys: make(map[string][]string),
-		defaultValues:   make(map[string]DefaultValueFunction),
-		persistedKeys:   make(map[string]bool),
+		viper:                viper.New(),
+		alternativeKeys:      make(map[string][]string),
+		defaultValues:        make(map[string]DefaultValueFunction),
+		persistedKeys:        make(map[string]bool),
+		interkeyDependencies: make(map[string][]string),
 	}
 	config.viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 
@@ -279,14 +293,13 @@ func (ev *extendedViper) Clone() Configuration {
 	defer ev.mutex.RUnlock()
 
 	// manually clone the Configuration instance
-	var clone Configuration
+	options := []Opts{}
 	if ev.configType == jsonFile {
 		configFileUsed := ev.viper.ConfigFileUsed()
-		clone = NewFromFiles(configFileUsed)
-	} else {
-		clone = NewInMemory()
+		options = append(options, WithFiles(configFileUsed))
 	}
 
+	clone := NewWithOpts(options...)
 	clone.SetStorage(ev.storage)
 	keys := ev.viper.AllKeys()
 	for i := range keys {
@@ -325,9 +338,21 @@ func (ev *extendedViper) Clone() Configuration {
 		items := ev.defaultCache.Items()
 		clonedCache := cache.NewFrom(cacheTTL, defaultCacheCleanupInterval, items)
 		evClone.setCache(clonedCache)
+		evClone.interkeyDependencies = ev.interkeyDependencies
 	}
 
 	return clone
+}
+
+func (ev *extendedViper) clearCache(key string) {
+	if ev.defaultCache != nil {
+		ev.defaultCache.Delete(key)
+
+		// clear cache of all keys that depend on the current key
+		for _, dependencyKey := range ev.interkeyDependencies[key] {
+			ev.clearCache(dependencyKey)
+		}
+	}
 }
 
 // Set sets a configuration value.
@@ -336,9 +361,8 @@ func (ev *extendedViper) Set(key string, value interface{}) {
 	localStorage := ev.storage
 	isPersisted := ev.persistedKeys[key]
 	ev.viper.Set(key, value)
-	if ev.defaultCache != nil {
-		ev.defaultCache.Delete(key)
-	}
+	ev.clearCache(key)
+
 	ev.mutex.Unlock()
 
 	if localStorage != nil && isPersisted {
@@ -459,7 +483,7 @@ func (ev *extendedViper) GetWithError(key string) (interface{}, error) {
 	// if nothing was found in the cache, try to execute the default function
 	if defaultFunc != nil {
 		var defErr error
-		value, defErr = defaultFunc(value)
+		value, defErr = defaultFunc(ev, value)
 		err = errors.Join(err, defErr)
 
 		// if enabled and no error occurred, store value in cache
@@ -477,22 +501,28 @@ func (ev *extendedViper) GetStringWithError(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if s, ok := result.(string); ok {
-		return s, nil
+
+	switch v := result.(type) {
+	case string:
+		return v, nil
+	case []string:
+		if len(v) == 0 {
+			return "", nil
+		}
+
+		return v[0], nil
 	}
+
 	return "", fmt.Errorf("value for key %s is not a string", key)
 }
 
 // GetString returns a configuration value as string.
 func (ev *extendedViper) GetString(key string) string {
-	result := ev.Get(key)
-	if result == nil {
+	result, err := ev.GetStringWithError(key)
+	if err != nil {
 		return ""
 	}
-	if s, ok := result.(string); ok {
-		return s
-	}
-	return ""
+	return result
 }
 
 // GetBoolWithError returns a configuration value as bool.
@@ -855,6 +885,39 @@ func (ev *extendedViper) getCacheSettings() (bool, time.Duration, error) {
 	}
 
 	return enabled, duration, nil
+}
+
+func (ev *extendedViper) detectCircularDependency(key string, dependencyKey string) error {
+	circularDependencyError := errors.New("circular dependency detected")
+
+	if key == dependencyKey {
+		return circularDependencyError
+	}
+
+	for _, existingKey := range ev.interkeyDependencies[key] {
+		if existingKey == dependencyKey {
+			return circularDependencyError
+		}
+
+		if err := ev.detectCircularDependency(existingKey, dependencyKey); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (ev *extendedViper) AddKeyDependency(key string, dependencyKey string) error {
+	ev.mutex.Lock()
+	defer ev.mutex.Unlock()
+
+	// detect circular dependencies
+	if err := ev.detectCircularDependency(key, dependencyKey); err != nil {
+		return err
+	}
+
+	ev.interkeyDependencies[dependencyKey] = append(ev.interkeyDependencies[dependencyKey], key)
+	return nil
 }
 
 func toBool(result interface{}) (bool, error) {

@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/snyk/error-catalog-golang-public/cli"
+	"github.com/snyk/go-application-framework/internal/api"
 	policyApi "github.com/snyk/go-application-framework/internal/api/policy/2024-10-15"
 	"github.com/snyk/go-application-framework/pkg/configuration"
 	"github.com/snyk/go-application-framework/pkg/local_workflows/local_models"
@@ -18,29 +19,55 @@ import (
 func addCreateIgnoreDefaultConfigurationValues(invocationCtx workflow.InvocationContext) {
 	config := invocationCtx.GetConfiguration()
 
-	config.AddDefaultValue(RemoteRepoUrlKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(RemoteRepoUrlKey, func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		return remoteRepoUrlDefaultFunc(existingValue, config)
 	})
 
-	config.AddDefaultValue(IgnoreTypeKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(IgnoreTypeKey, func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		isSet := config.IsSet(IgnoreTypeKey)
 		return defaultFuncWithValidator(existingValue, isSet, isValidIgnoreType)
 	})
 
-	config.AddDefaultValue(ExpirationKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(ExpirationKey, func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		isSet := config.IsSet(ExpirationKey)
 		return defaultFuncWithValidator(existingValue, isSet, isValidExpirationDate)
 	})
 
-	config.AddDefaultValue(FindingsIdKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(FindingsIdKey, func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		isSet := config.IsSet(FindingsIdKey)
 		return defaultFuncWithValidator(existingValue, isSet, isValidFindingsId)
 	})
 
-	config.AddDefaultValue(ReasonKey, func(existingValue interface{}) (interface{}, error) {
+	config.AddDefaultValue(ReasonKey, func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		isSet := config.IsSet(ReasonKey)
 		return defaultFuncWithValidator(existingValue, isSet, isValidReason)
 	})
+}
+
+func getOrgIgnoreApprovalEnabled(engine workflow.Engine) configuration.DefaultValueFunction {
+	return func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
+		if existingValue != nil {
+			return existingValue, nil
+		}
+
+		config := engine.GetConfiguration()
+		org := config.GetString(configuration.ORGANIZATION)
+		client := engine.GetNetworkAccess().GetHttpClient()
+		url := config.GetString(configuration.API_URL)
+		apiClient := api.NewApi(url, client)
+
+		settings, err := apiClient.GetOrgSettings(org)
+		if err != nil {
+			engine.GetLogger().Err(err).Msg("Failed to access settings.")
+			return nil, err
+		}
+
+		if settings.Ignores != nil && settings.Ignores.ApprovalWorkflowEnabled {
+			return true, nil
+		}
+
+		return false, nil
+	}
 }
 
 func remoteRepoUrlDefaultFunc(existingValue interface{}, config configuration.Configuration) (interface{}, error) {

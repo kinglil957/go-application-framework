@@ -945,6 +945,12 @@ components:
       description: Locally configured policy options for determining outcome of this
         specific test.
       properties:
+        fail_on_upgradable:
+          default: false
+          description: |-
+            Use to fail a test when there is at least one vulnerable finding that can be fixed by upgrading the version of the related
+               dependency. E.g. bumping lodash from 1.1.1 to 1.1.2.
+          type: boolean
         risk_score_threshold:
           description: Findings of equal or greater risk score will fail the test.
           format: uint16
@@ -954,7 +960,6 @@ components:
         severity_threshold:
           allOf:
           - $ref: '#/components/schemas/Severity'
-          default: medium
           description: Findings of equal or greater severity will fail the test.
         suppress_pending_ignores:
           default: false
@@ -1241,7 +1246,6 @@ components:
           type: string
       required:
       - source
-      - paths
       - reachability
       type: object
     ReachabilityType:
@@ -1315,6 +1319,27 @@ components:
       - type
       - sbom_bundle_id
       - code_bundle_id
+      - locator
+      type: object
+    SbomSubject:
+      description: Test subject for SBOM test with reachability analysis.
+      properties:
+        locator:
+          allOf:
+          - $ref: '#/components/schemas/LocalPathLocator'
+          description: Locate the local paths from which the SBOM and source code
+            were derived.
+        sbom_bundle_id:
+          description: The SBOM to test for vulnerable dependencies.
+          pattern: ^[a-fA-F0-9]{64}$
+          type: string
+        type:
+          enum:
+          - sbom
+          type: string
+      required:
+      - type
+      - sbom_bundle_id
       - locator
       type: object
     ScmRepoLocator:
@@ -1560,6 +1585,10 @@ components:
 
             This applies to private packages distributed with ecosystem tooling as well
             as those publicly distributed.
+        epss_details:
+          allOf:
+          - $ref: '#/components/schemas/snykvulndb.EpssDetails'
+          description: EPSS details - see note on model definition.
         exploit_details:
           allOf:
           - $ref: '#/components/schemas/snykvulndb.ExploitDetails'
@@ -1606,6 +1635,13 @@ components:
         package_name:
           description: Package name.
           type: string
+        package_popularity_rank:
+          description: |-
+            Percentile rank indicating the package's prevalence across Snyk-monitored projects.
+            A higher rank signifies the package is used in a larger percentage of projects.
+          maximum: 100
+          minimum: 0
+          type: number
         package_repository_url:
           description: Link to the package repository containing the vulnerable package.
           example: https://repo.maven.apache.org/maven2
@@ -1985,6 +2021,7 @@ components:
           dep_graph: '#/components/schemas/DepGraphSubject'
           git_url_coordinates: '#/components/schemas/GitUrlCoordinatesSubject'
           other: '#/components/schemas/OtherSubject'
+          sbom: '#/components/schemas/SbomSubject'
           sbom_reachability: '#/components/schemas/SbomReachabilitySubject'
         propertyName: type
       oneOf:
@@ -1993,6 +2030,7 @@ components:
       - $ref: '#/components/schemas/GitUrlCoordinatesSubject'
       - $ref: '#/components/schemas/SbomReachabilitySubject'
       - $ref: '#/components/schemas/OtherSubject'
+      - $ref: '#/components/schemas/SbomSubject'
     TestSubjectCreate:
       description: |-
         The subject of a test, which identifies the asset/project and content references
@@ -2003,6 +2041,7 @@ components:
           dep_graph: '#/components/schemas/DepGraphSubjectCreate'
           git_url_coordinates: '#/components/schemas/GitUrlCoordinatesSubject'
           other: '#/components/schemas/OtherSubject'
+          sbom: '#/components/schemas/SbomSubject'
           sbom_reachability: '#/components/schemas/SbomReachabilitySubject'
         propertyName: type
       oneOf:
@@ -2011,6 +2050,7 @@ components:
       - $ref: '#/components/schemas/GitUrlCoordinatesSubject'
       - $ref: '#/components/schemas/SbomReachabilitySubject'
       - $ref: '#/components/schemas/OtherSubject'
+      - $ref: '#/components/schemas/SbomSubject'
     TestSubjectLocator:
       discriminator:
         mapping:
@@ -2414,6 +2454,34 @@ components:
       - secondary
       - other
       type: string
+    snykvulndb.EpssDetails:
+      description: |-
+        Exploit Prediction Scoring System (EPSS), which predicts the likelihood (probability) of the vulnerability to be
+        exploited, and the percentile of the EPSS of a vulnerability relative to all other vulnerabilities.
+        We are using the latest model.
+        https://www.first.org/epss/model
+      properties:
+        model_version:
+          description: The version of the EPSS model we use.
+          example: v2025.03.14
+          type: string
+        percentile:
+          description: |-
+            The percentile of the EPSS of a vulnerability relative to all other vulnerabilities.
+            In value range 0 - 1 with 5 fixed digits.
+          example: "0.73768"
+          type: string
+        probability:
+          description: |-
+            The probability of the vulnerability to be exploited.
+            In value range 0 - 1 with 5 fixed digits.
+          example: "0.00859"
+          type: string
+      required:
+      - percentile
+      - probability
+      - model_version
+      type: object
     snykvulndb.ExploitDetails:
       description: Details about the exploitability of a vulnerability.
       properties:
@@ -2889,6 +2957,7 @@ paths:
             pathId: org_id
             permissions:
             - read
+            - package.test
             type: org
           skip: false
       x-snyk-api-lifecycle: released
@@ -3105,7 +3174,7 @@ paths:
       x-stability-level: beta
 servers:
 - description: test-api-shim
-  url: /closed-beta
+  url: /rest
 tags:
 - description: The OpenAPI specification for test-api-shim.
   name: OpenAPI

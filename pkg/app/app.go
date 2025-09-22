@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/fips140"
 	"io"
 	"log"
 	"net/http"
@@ -28,7 +29,12 @@ import (
 )
 
 func defaultFuncOrganizationSlug(engine workflow.Engine, config configuration.Configuration, logger *zerolog.Logger, apiClientFactory func(url string, client *http.Client) api.ApiClient) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
+	err := config.AddKeyDependency(configuration.ORGANIZATION_SLUG, configuration.ORGANIZATION)
+	if err != nil {
+		logger.Print("Failed to add dependency for ORGANIZATION_SLUG:", err)
+	}
+
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		client := engine.GetNetworkAccess().GetHttpClient()
 		url := config.GetString(configuration.API_URL)
 		apiClient := apiClientFactory(url, client)
@@ -46,7 +52,12 @@ func defaultFuncOrganizationSlug(engine workflow.Engine, config configuration.Co
 }
 
 func defaultFuncOrganization(engine workflow.Engine, config configuration.Configuration, logger *zerolog.Logger, apiClientFactory func(url string, client *http.Client) api.ApiClient) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
+	err := config.AddKeyDependency(configuration.ORGANIZATION, configuration.API_URL)
+	if err != nil {
+		logger.Print("Failed to add dependency for ORGANIZATION:", err)
+	}
+
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		client := engine.GetNetworkAccess().GetHttpClient()
 		url := config.GetString(configuration.API_URL)
 		apiClient := apiClientFactory(url, client)
@@ -72,15 +83,33 @@ func defaultFuncOrganization(engine workflow.Engine, config configuration.Config
 			logger.Print("Failed to determine default value for \"ORGANIZATION\":", err)
 		}
 
-		return orgId, nil
+		return orgId, err
 	}
 	return callback
 }
 
-func defaultFuncApiUrl(config configuration.Configuration, logger *zerolog.Logger) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
-		urlString := constants.SNYK_DEFAULT_API_URL
+func defaultFuncApiUrl(globalConfig configuration.Configuration, logger *zerolog.Logger) configuration.DefaultValueFunction {
+	err := globalConfig.AddKeyDependency(configuration.API_URL, configuration.AUTHENTICATION_TOKEN)
+	if err != nil {
+		logger.Print("Failed to add dependency for API_URL:", err)
+	}
+	err = globalConfig.AddKeyDependency(configuration.API_URL, auth.CONFIG_KEY_OAUTH_TOKEN)
+	if err != nil {
+		logger.Print("Failed to add dependency for API_URL:", err)
+	}
 
+	callback := func(config configuration.Configuration, existingValue interface{}) (interface{}, error) {
+		urlString := constants.SNYK_DEFAULT_API_URL
+		authToken := config.GetString(configuration.AUTHENTICATION_TOKEN)
+
+		// If a user specified their own value, start by respecting that
+		if existingValue != nil {
+			if temp, ok := existingValue.(string); ok {
+				urlString = temp
+			}
+		}
+
+		// If an oauth token is provided, with a URL in the audience claim, use that instead
 		urlFromOauthToken, err := auth.GetAudienceClaimFromOauthToken(config.GetString(auth.CONFIG_KEY_OAUTH_TOKEN))
 		if err != nil {
 			logger.Warn().Err(err).Msg("failed to read oauth token")
@@ -88,9 +117,16 @@ func defaultFuncApiUrl(config configuration.Configuration, logger *zerolog.Logge
 
 		if len(urlFromOauthToken) > 0 && len(urlFromOauthToken[0]) > 0 {
 			urlString = urlFromOauthToken[0]
-		} else if existingValue != nil { // try the configured value as last resort
-			if temp, ok := existingValue.(string); ok {
-				urlString = temp
+		}
+
+		// Same logic for PAT - if a PAT is provided, and it has a URL in the claims, use that instead
+		if auth.IsAuthTypePAT(authToken) {
+			apiUrl, claimsErr := auth.GetApiUrlFromPAT(authToken)
+			if claimsErr != nil {
+				logger.Warn().Err(claimsErr).Msg("failed to get api url from pat")
+			}
+			if len(apiUrl) > 0 {
+				urlString = apiUrl
 			}
 		}
 
@@ -104,22 +140,39 @@ func defaultFuncApiUrl(config configuration.Configuration, logger *zerolog.Logge
 }
 
 func defaultInputDirectory() configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
-		if existingValue == nil {
-			path, err := os.Getwd()
-			if err != nil {
-				return "", err
-			}
-			return path, nil
-		} else {
-			return existingValue, nil
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
+		// Check if we have a valid string value
+		existingString, isString := existingValue.(string)
+		if isString && len(existingString) > 0 {
+			// Return the string value as-is (preserving any whitespace)
+			return existingString, nil
 		}
+
+		existingStringSlice, isStringSlice := existingValue.([]string)
+		resultingSlice := []string{}
+		for _, s := range existingStringSlice {
+			if len(s) > 0 {
+				resultingSlice = append(resultingSlice, s)
+			}
+		}
+
+		if isStringSlice && len(resultingSlice) > 0 {
+			// Return the string value as-is (preserving any whitespace)
+			return resultingSlice, nil
+		}
+
+		// Fall back to current working directory for non-string types or empty strings
+		path, err := os.Getwd()
+		if err != nil {
+			return ".", err
+		}
+		return path, nil
 	}
 	return callback
 }
 
 func defaultTempDirectory(engine workflow.Engine, config configuration.Configuration, logger *zerolog.Logger) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		version := "0.0.0"
 		ri := engine.GetRuntimeInfo()
 		if ri != nil && len(ri.GetVersion()) > 0 {
@@ -150,7 +203,7 @@ func defaultTempDirectory(engine workflow.Engine, config configuration.Configura
 }
 
 func defaultPreviewFeaturesEnabled(engine workflow.Engine) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		if existingValue != nil {
 			return existingValue, nil
 		}
@@ -172,7 +225,7 @@ func defaultPreviewFeaturesEnabled(engine workflow.Engine) configuration.Default
 }
 
 func defaultMaxNetworkRetryAttempts(engine workflow.Engine) configuration.DefaultValueFunction {
-	callback := func(existingValue interface{}) (interface{}, error) {
+	callback := func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		const multipleAttempts = 3 // three here is chosen based on other places in the application
 		const singleAttempt = 1
 
@@ -211,18 +264,24 @@ func initConfiguration(engine workflow.Engine, config configuration.Configuratio
 	config.AddDefaultValue(configuration.AUTHENTICATION_SUBDOMAINS, configuration.StandardDefaultValueFunction([]string{"deeproxy"}))
 	config.AddDefaultValue(configuration.MAX_THREADS, configuration.StandardDefaultValueFunction(runtime.NumCPU()))
 	config.AddDefaultValue(presenters.CONFIG_JSON_STRIP_WHITESPACES, configuration.StandardDefaultValueFunction(true))
-	config.AddDefaultValue(auth.CONFIG_KEY_ALLOWED_HOST_REGEXP, configuration.StandardDefaultValueFunction(`^api(\.(.+))?\.snyk|snykgov\.io$`))
+	config.AddDefaultValue(auth.CONFIG_KEY_ALLOWED_HOST_REGEXP, configuration.StandardDefaultValueFunction(constants.SNYK_DEFAULT_ALLOWED_HOST_REGEXP))
 
 	// set default filesize threshold to 512MB
 	config.AddDefaultValue(configuration.IN_MEMORY_THRESHOLD_BYTES, configuration.StandardDefaultValueFunction(constants.SNYK_DEFAULT_IN_MEMORY_THRESHOLD_MB))
-	config.AddDefaultValue(configuration.API_URL, defaultFuncApiUrl(config, logger))
 	config.AddDefaultValue(configuration.TEMP_DIR_PATH, defaultTempDirectory(engine, config, logger))
 
-	config.AddDefaultValue(configuration.WEB_APP_URL, func(existingValue any) (any, error) {
-		canonicalApiUrl := config.GetString(configuration.API_URL)
-		appUrl, err := api.DeriveAppUrl(canonicalApiUrl)
-		if err != nil {
-			logger.Print("Failed to determine default value for \"WEB_APP_URL\":", err)
+	config.AddDefaultValue(configuration.API_URL, defaultFuncApiUrl(config, logger))
+
+	err = config.AddKeyDependency(configuration.WEB_APP_URL, configuration.API_URL)
+	if err != nil {
+		logger.Print("Failed to add dependency for WEB_APP_URL:", err)
+	}
+
+	config.AddDefaultValue(configuration.WEB_APP_URL, func(c configuration.Configuration, existingValue any) (any, error) {
+		canonicalApiUrl := c.GetString(configuration.API_URL)
+		appUrl, appUrlErr := api.DeriveAppUrl(canonicalApiUrl)
+		if appUrlErr != nil {
+			logger.Print("Failed to determine default value for \"WEB_APP_URL\":", appUrlErr)
 		}
 
 		return appUrl, nil
@@ -231,7 +290,7 @@ func initConfiguration(engine workflow.Engine, config configuration.Configuratio
 	config.AddDefaultValue(configuration.ORGANIZATION, defaultFuncOrganization(engine, config, logger, apiClientFactory))
 	config.AddDefaultValue(configuration.ORGANIZATION_SLUG, defaultFuncOrganizationSlug(engine, config, logger, apiClientFactory))
 
-	config.AddDefaultValue(configuration.FF_OAUTH_AUTH_FLOW_ENABLED, func(existingValue any) (any, error) {
+	config.AddDefaultValue(configuration.FF_OAUTH_AUTH_FLOW_ENABLED, func(_ configuration.Configuration, existingValue any) (any, error) {
 		if existingValue == nil {
 			return true, nil
 		} else {
@@ -239,7 +298,12 @@ func initConfiguration(engine workflow.Engine, config configuration.Configuratio
 		}
 	})
 
-	config.AddDefaultValue(configuration.IS_FEDRAMP, func(existingValue any) (any, error) {
+	err = config.AddKeyDependency(configuration.IS_FEDRAMP, configuration.API_URL)
+	if err != nil {
+		logger.Print("Failed to add dependency for IS_FEDRAMP:", err)
+	}
+
+	config.AddDefaultValue(configuration.IS_FEDRAMP, func(_ configuration.Configuration, existingValue any) (any, error) {
 		if existingValue == nil {
 			return api.IsFedramp(config.GetString(configuration.API_URL)), nil
 		} else {
@@ -251,10 +315,11 @@ func initConfiguration(engine workflow.Engine, config configuration.Configuratio
 	config.AddDefaultValue(configuration.PREVIEW_FEATURES_ENABLED, defaultPreviewFeaturesEnabled(engine))
 	config.AddDefaultValue(configuration.CUSTOM_CONFIG_FILES, customConfigFiles(config))
 	config.AddDefaultValue(middleware.ConfigurationKeyRetryAttempts, defaultMaxNetworkRetryAttempts(engine))
+	config.AddDefaultValue(configuration.FIPS_ENABLED, configuration.StandardDefaultValueFunction(fips140.Enabled()))
 }
 
 func customConfigFiles(config configuration.Configuration) configuration.DefaultValueFunction {
-	return func(existingValue interface{}) (interface{}, error) {
+	return func(_ configuration.Configuration, existingValue interface{}) (interface{}, error) {
 		var files []string
 		// last file usually wins if the same values are configured
 		// Precedence should be:
